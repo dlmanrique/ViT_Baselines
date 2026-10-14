@@ -1,21 +1,32 @@
 """
-Evaluation metrics for frame-wise surgical gesture recognition on SAR-RARP50.
+Evaluation metrics for the frame-wise SAR-RARP50 tasks. compute_metrics picks
+the metric set from the task type:
 
-Frame-wise metrics pool all frames of a split: accuracy, balanced accuracy,
-macro precision / recall / F1 (averaged over the classes present in the ground
-truth), per-class scores and the confusion matrix.
+multiclass (gesture recognition)
+    Frame-wise metrics pool all frames of a split: accuracy, balanced accuracy,
+    macro precision / recall / F1 (averaged over the classes present in the
+    ground truth), per-class scores and the confusion matrix.
+    Segmental metrics are computed per video on the 10 Hz label sequence
+    ordered by frame_id and then averaged over videos: F1@{10,25,50} and Edit
+    score. F1@k is the official SAR-RARP50 implementation
+    (sarrarp50/metrics/action_recognition.py in
+    github.com/surgical-vision/SAR_RARP50-evaluation), and so is the challenge
+    action score: sqrt(mean video accuracy * mean video F1@10).
 
-Segmental metrics are computed per video on the 10 Hz label sequence ordered by
-frame_id and then averaged over videos: F1@{10,25,50} and Edit score. F1@k is
-the official SAR-RARP50 implementation (sarrarp50/metrics/action_recognition.py
-in github.com/surgical-vision/SAR_RARP50-evaluation), and so is the challenge
-action score: sqrt(mean video accuracy * mean video F1@10).
+binary (error detection)
+    AUC and AP of the error probability, computed with sklearn on all frames of
+    the split pooled together, as in SEDMamba (github.com/wzjialang/SEDMamba,
+    inference.py). Thresholded metrics of the predicted class (error
+    probability > 0.5): accuracy, balanced accuracy, precision, recall,
+    specificity and F1 of the error class, per-class scores, the confusion
+    matrix and per-video scores.
 
 All metrics are fractions in [0, 1].
 """
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 F1_OVERLAPS = (0.10, 0.25, 0.50)
 
@@ -123,18 +134,79 @@ def per_video_metrics(video_ids, frame_ids, labels, preds):
     return pd.DataFrame(rows)
 
 
-def compute_metrics(video_ids, frame_ids, labels, preds, num_classes, class_names=None):
-    """Compute every metric of one split.
+def compute_metrics(task_type, video_ids, frame_ids, labels, probs, class_names):
+    """Compute every metric of one split for a 'multiclass' or 'binary' task.
+
+    probs is the (num_frames x num_classes) array of class probabilities; the
+    predicted class is its argmax and, for binary tasks, the score of the
+    positive class is probs[:, 1].
 
     Returns a dict with:
-        scalars:          {metric name: float}, frame-wise and video-averaged metrics
-                          plus the SAR-RARP50 action score.
+        scalars:          {metric name: float}
         per_class:        DataFrame with precision, recall, F1 and support per class.
-        per_video:        DataFrame with accuracy, Edit and F1@k per video.
+        per_video:        DataFrame with the per-video metrics.
         confusion_matrix: (num_classes x num_classes) array.
     """
     labels = np.asarray(labels, dtype=np.int64)
-    preds = np.asarray(preds, dtype=np.int64)
+    probs = np.asarray(probs)
+    preds = probs.argmax(axis=1)
+    if task_type == 'binary':
+        return binary_metrics(video_ids, labels, preds, probs[:, 1], class_names)
+    if task_type == 'multiclass':
+        return multiclass_metrics(video_ids, frame_ids, labels, preds, class_names)
+    raise ValueError(f'Unknown task type {task_type}')
+
+
+def binary_metrics(video_ids, labels, preds, scores, class_names):
+    """Metrics of frame-wise binary detection (label 1 = positive class, e.g. error).
+
+    AUC and AP use the positive-class scores of all frames pooled together, as
+    in SEDMamba. Thresholded metrics use the predicted classes. Per-video AUC
+    and AP are NaN for a video whose frames all have the same label.
+    """
+    cm = confusion_matrix(labels, preds, 2)
+    tn, fp, fn, tp = cm.ravel().astype(float)
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0.0
+    specificity = tn / (tn + fp) if tn + fp > 0 else 0.0
+    scalars = {
+        'auc': float(roc_auc_score(labels, scores)),
+        'ap': float(average_precision_score(labels, scores)),
+        'accuracy': float((tp + tn) / cm.sum()),
+        'balanced_accuracy': float((recall + specificity) / 2),
+        'precision': float(precision),
+        'recall': float(recall),
+        'specificity': float(specificity),
+        'f1': float(2 * precision * recall / (precision + recall)) if precision + recall > 0 else 0.0,
+    }
+    _, per_class = framewise_metrics(cm)
+    per_class_df = pd.DataFrame({'class_id': range(2), 'class_name': class_names, **per_class})
+
+    df = pd.DataFrame({'video_id': video_ids, 'label': labels, 'pred': preds, 'score': scores})
+    rows = []
+    for video_id, video in df.groupby('video_id', sort=True):
+        y, p, s = video['label'].to_numpy(), video['pred'].to_numpy(), video['score'].to_numpy()
+        tp_video = int(((p == 1) & (y == 1)).sum())
+        both_labels = len(np.unique(y)) == 2
+        rows.append({
+            'video_id': video_id,
+            'num_frames': len(video),
+            'positive_frames': int(y.sum()),
+            'accuracy': float((p == y).mean()),
+            'f1': float(2 * tp_video / (p.sum() + y.sum())) if p.sum() + y.sum() > 0 else 0.0,
+            'auc': float(roc_auc_score(y, s)) if both_labels else float('nan'),
+            'ap': float(average_precision_score(y, s)) if both_labels else float('nan'),
+        })
+    return {'scalars': scalars, 'per_class': per_class_df, 'per_video': pd.DataFrame(rows), 'confusion_matrix': cm}
+
+
+def multiclass_metrics(video_ids, frame_ids, labels, preds, class_names):
+    """Metrics of frame-wise multiclass recognition (gestures): frame-wise, segmental and the SAR-RARP50 score.
+
+    scalars has the frame-wise and video-averaged metrics plus the SAR-RARP50
+    action score; per_video has accuracy, Edit and F1@k per video.
+    """
+    num_classes = len(class_names)
     cm = confusion_matrix(labels, preds, num_classes)
     scalars, per_class = framewise_metrics(cm)
 
@@ -146,6 +218,5 @@ def compute_metrics(video_ids, frame_ids, labels, preds, num_classes, class_name
     scalars['edit'] = float(per_video['edit'].mean())
     scalars['action_score'] = float(np.sqrt(scalars['video_accuracy'] * scalars['f1@10']))
 
-    names = class_names if class_names is not None else [str(c) for c in range(num_classes)]
-    per_class_df = pd.DataFrame({'class_id': range(num_classes), 'class_name': names, **per_class})
+    per_class_df = pd.DataFrame({'class_id': range(num_classes), 'class_name': class_names, **per_class})
     return {'scalars': scalars, 'per_class': per_class_df, 'per_video': per_video, 'confusion_matrix': cm}

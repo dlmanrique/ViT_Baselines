@@ -1,54 +1,87 @@
 """
-Shared code for the frame-wise ViT baseline on SAR-RARP50 gesture recognition.
+Shared code for the frame-wise ViT baselines on SAR-RARP50.
 
 - Command line arguments (parse_args) and default paths.
-- Gesture class names.
-- Frame dataset: one sample per annotated 10 Hz frame, read from the JPEGs
+- Task registry (TASKS): split folder, CSV name and class names of each task
+  selected with --task.
+- Frame dataset: one sample per annotated frame, read from the JPEGs
   written by SAR-RARP50/extract_frames_sarrarp50.py
   (<video_dir>/frames/<frame_id:09d>.jpg).
 - Image transforms, data loaders, class weights, optimizer parameter groups,
-  LR schedule, seeding, logging and JSON saving.
+  LR schedule and seeding.
+- Timeline plot of ground-truth vs predicted classes per video (inference).
 
 Default paths are resolved from this file's folder (ViT_Baselines/), so the
 run does not depend on the current working directory.
 """
 
 import argparse
-import json
-import logging
 import math
 import os
 import random
-import sys
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import torch
+from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
+from metrics import segment_intervals
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SAR_ROOT = os.path.join(SCRIPT_DIR, 'Datasets', 'SAR-RARP50')
-DEFAULT_SPLITS_DIR = os.path.join(SCRIPT_DIR, 'Datasets', 'preprocess_sarrarp50', 'gesture_recognition')
+PREPROCESS_DIR = os.path.join(SCRIPT_DIR, 'Datasets', 'preprocess_sarrarp50')
 DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'outputs')
 
-CLASS_NAMES = [
-    'Other',
-    'Picking-up needle',
-    'Positioning needle tip',
-    'Pushing needle',
-    'Pulling needle',
-    'Tying knot',
-    'Cutting suture',
-    'Returning needle',
-]
-NUM_CLASSES = len(CLASS_NAMES)
+# One entry per task:
+#   splits_dir   folder with the split CSVs ({split}_sarrarp50_{csv_suffix}.csv)
+#   type         metric set of metrics.compute_metrics ('multiclass' or 'binary')
+#   monitor      validation metric that selects the best checkpoint
+#   class_names  index = annotation value
+#   class_colors (optional) one color per class; enables the test timeline plot of the inference
+TASKS = {
+    'gesture_recognition': {
+        'splits_dir': os.path.join(PREPROCESS_DIR, 'gesture_recognition'),
+        'csv_suffix': 'gestures',
+        'type': 'multiclass',
+        'monitor': 'accuracy',
+        'class_names': [
+            'Other',
+            'Picking-up needle',
+            'Positioning needle tip',
+            'Pushing needle',
+            'Pulling needle',
+            'Tying knot',
+            'Cutting suture',
+            'Returning needle',
+        ],
+        # Gray for Other; the hues are ordered so that the gestures that follow each other in
+        # time (>= 1% of the transitions) stay distinguishable: worst pair OKLab Delta E 12.3
+        # under protan/deutan simulation and 17.8 with normal vision.
+        'class_colors': ['#898781', '#eda100', '#008300', '#e87ba4', '#2a78d6', '#eb6834', '#1baf7a', '#6250d6'],
+    },
+    'error_detection': {
+        'splits_dir': os.path.join(PREPROCESS_DIR, 'error_detection'),
+        'csv_suffix': 'errors',
+        'type': 'binary',
+        'monitor': 'ap',
+        'class_names': ['Normal', 'Error'],
+    },
+}
 SPLITS = ('train', 'val', 'test')
 FRAMES_DIR = 'frames'
 FRAME_ASPECT = 16 / 9  # extracted frames are 960x540
-MONITOR_METRICS = ('f1_macro', 'accuracy', 'action_score', 'f1@10')
+VIDEO_FPS = 60  # frame_id is the frame index in the 60 fps video_left.avi
+
+# Plot styling (same tokens as the preprocess_sarrarp50 figures)
+SURFACE = '#fcfcfb'
+INK_PRIMARY = '#0b0b0b'
+INK_SECONDARY = '#52514e'
+INK_MUTED = '#898781'
+BASELINE = '#c3c2b7'
 
 
 # ---------------------------------------------------------------------------
@@ -58,13 +91,15 @@ MONITOR_METRICS = ('f1_macro', 'accuracy', 'action_score', 'f1@10')
 def parse_args(argv=None):
     """Parse the command line arguments of main.py."""
     parser = argparse.ArgumentParser(
-        description='Frame-wise ViT (ImageNet weights) for SAR-RARP50 gesture recognition.')
+        description='Frame-wise ViT (ImageNet weights) for SAR-RARP50: training or inference (--eval_only).')
 
     data = parser.add_argument_group('data')
+    data.add_argument('--task', choices=list(TASKS), default='gesture_recognition',
+                      help='Task: selects the split CSVs and the class names.')
     data.add_argument('--sar_root', default=DEFAULT_SAR_ROOT,
                       help='SAR-RARP50 root containing <split>/video_xx/frames/*.jpg.')
-    data.add_argument('--splits_dir', default=DEFAULT_SPLITS_DIR,
-                      help='Folder with {train,val,test}_sarrarp50_gestures.csv.')
+    data.add_argument('--splits_dir', default=None,
+                      help="Folder with the task's {train,val,test} CSVs (default: preprocess_sarrarp50/<task>).")
     data.add_argument('--num_workers', type=int, default=8, help='Data loader worker processes.')
 
     model = parser.add_argument_group('model')
@@ -77,7 +112,7 @@ def parse_args(argv=None):
     model.add_argument('--dropout', type=float, default=0.0, help='Dropout before the classification head.')
 
     train = parser.add_argument_group('training')
-    train.add_argument('--epochs', type=int, default=20)
+    train.add_argument('--epochs', type=int, default=15)
     train.add_argument('--batch_size', type=int, default=64)
     train.add_argument('--eval_batch_size', type=int, default=128)
     train.add_argument('--lr', type=float, default=5e-5, help='Peak learning rate (AdamW).')
@@ -93,26 +128,30 @@ def parse_args(argv=None):
     train.add_argument('--color_jitter', type=float, default=0.2,
                        help='Brightness/contrast/saturation jitter for training (0 disables it).')
     train.add_argument('--no_amp', action='store_true', help='Disable bfloat16 autocast.')
-    train.add_argument('--monitor', choices=MONITOR_METRICS, default='f1_macro',
-                       help='Validation metric used to keep best.pt.')
-    train.add_argument('--log_every', type=int, default=200, help='Log the training loss every N steps.')
+    train.add_argument('--log_every', type=int, default=50, help='Log the training loss to wandb every N steps.')
 
     run = parser.add_argument_group('run')
-    run.add_argument('--output_dir', default=DEFAULT_OUTPUT_DIR, help='Parent folder of the run folders.')
-    run.add_argument('--exp_name', default=None, help='Run folder name (default: <model>_<timestamp>).')
+    run.add_argument('--output_dir', default=DEFAULT_OUTPUT_DIR,
+                     help='Folder with one subfolder per run (<run name>/best.pt) and the local wandb files.')
     run.add_argument('--device', default='cuda:0')
     run.add_argument('--seed', type=int, default=42)
     run.add_argument('--eval_only', action='store_true',
-                     help='Skip training and evaluate --checkpoint on val and test.')
-    run.add_argument('--checkpoint', default=None, help='Checkpoint (.pt) evaluated with --eval_only.')
+                     help='Inference: evaluate --checkpoint on the val and test splits of --task and print the '
+                          'metrics (no training, no wandb).')
+    run.add_argument('--checkpoint', default=None, help='Path of the trained ViT (best.pt) used with --eval_only.')
+
+    logging_group = parser.add_argument_group('wandb')
+    logging_group.add_argument('--wandb_project', default='ViT_Baselines')
+    logging_group.add_argument('--wandb_entity', default='dl-manrique',
+                               help='wandb user or team that owns the project (default: personal account).')
+    logging_group.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online',
+                               help='"disabled" runs without wandb, e.g. for a quick code test.')
 
     args = parser.parse_args(argv)
     if args.eval_only and not args.checkpoint:
         parser.error('--eval_only requires --checkpoint')
     if not 0 < args.crop_scale_min <= 1:
         parser.error('--crop_scale_min must be in (0, 1]')
-    if args.exp_name is None:
-        args.exp_name = f"{args.model.split('.')[0]}_{datetime.now():%Y%m%d_%H%M%S}"
     return args
 
 
@@ -135,13 +174,17 @@ def find_frame_dirs(sar_root):
     return frame_dirs
 
 
-def load_split(splits_dir, split):
-    """Read {split}_sarrarp50_gestures.csv (video_id, frame_id, annotation), sorted by video and frame."""
-    path = os.path.join(splits_dir, f'{split}_sarrarp50_gestures.csv')
+def load_split(splits_dir, task, split):
+    """Read {split}_sarrarp50_{csv_suffix}.csv of a task (video_id, frame_id, annotation), sorted by video and frame.
+
+    task is an entry of TASKS.
+    """
+    path = os.path.join(splits_dir, f"{split}_sarrarp50_{task['csv_suffix']}.csv")
+    num_classes = len(task['class_names'])
     df = pd.read_csv(path)
-    invalid = ~df['annotation'].between(0, NUM_CLASSES - 1)
+    invalid = ~df['annotation'].between(0, num_classes - 1)
     if invalid.any():
-        raise ValueError(f'{path}: {int(invalid.sum())} rows with a label outside [0, {NUM_CLASSES - 1}]')
+        raise ValueError(f'{path}: {int(invalid.sum())} rows with a label outside [0, {num_classes - 1}]')
     return df.sort_values(['video_id', 'frame_id']).reset_index(drop=True)
 
 
@@ -158,8 +201,8 @@ def check_frames(df, frame_dirs):
         raise FileNotFoundError(f'{len(missing)} frames missing, e.g. {missing[:5]}')
 
 
-class GestureFrameDataset(Dataset):
-    """One sample per row of a gesture split: (transformed frame, gesture label)."""
+class FrameDataset(Dataset):
+    """One sample per row of a split CSV: (transformed frame, annotation)."""
 
     def __init__(self, df, frame_dirs, transform):
         self.paths = [os.path.join(frame_dirs[video_id], f'{frame_id:09d}.jpg')
@@ -277,28 +320,46 @@ def set_seed(seed):
 
 
 # ---------------------------------------------------------------------------
-# Logging and files
+# Plots
 # ---------------------------------------------------------------------------
 
-def setup_logger(log_path):
-    """Return a logger that writes to stdout and to log_path."""
-    logger = logging.getLogger('vit_gestures')
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    formatter = logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(log_path)):
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-    return logger
+def plot_timelines(df, preds, per_video, class_names, class_colors, video_ids, path, title):
+    """Save one panel per video with the ground-truth and predicted class of every frame as colored ribbons.
 
-
-def save_json(obj, path):
-    """Write obj as indented JSON, converting numpy scalars and arrays."""
-    def default(value):
-        if isinstance(value, np.generic):
-            return value.item()
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        raise TypeError(f'Not JSON serializable: {type(value)}')
-    with open(path, 'w') as f:
-        json.dump(obj, f, indent=2, default=default)
+    df holds the split rows (video_id, frame_id, annotation) in the same order
+    as preds; per_video is the per-video metrics table, used in the panel
+    titles. The x axis is the video time in minutes (frame_id / 60 fps).
+    """
+    rows = df.assign(pred=preds)
+    scores = per_video.set_index('video_id')
+    fig = Figure(figsize=(12, 1.7 * len(video_ids) + 1.2), facecolor=SURFACE, layout='constrained')
+    axes = fig.subplots(len(video_ids), 1, squeeze=False)[:, 0]
+    for ax, video_id in zip(axes, video_ids):
+        video = rows[rows['video_id'] == video_id].sort_values('frame_id')
+        frames = video['frame_id'].to_numpy()
+        step = np.diff(frames).min()
+        for y, column in ((1.0, 'annotation'), (0.0, 'pred')):
+            labels, starts, ends = segment_intervals(video[column].to_numpy())
+            start_min = frames[starts] / VIDEO_FPS / 60
+            width_min = (frames[ends - 1] + step - frames[starts]) / VIDEO_FPS / 60
+            for c, color in enumerate(class_colors):
+                mask = labels == c
+                if mask.any():
+                    ax.broken_barh(list(zip(start_min[mask], width_min[mask])), (y, 0.8), facecolors=color,
+                                   linewidth=0)
+        score = scores.loc[video_id]
+        ax.set_title(f"{video_id}   accuracy {score['accuracy']:.3f} · F1@10 {score['f1@10']:.3f} · "
+                     f"edit {score['edit']:.3f}", loc='left', fontsize=10, color=INK_PRIMARY)
+        ax.set_xlim(0, (frames[-1] + step) / VIDEO_FPS / 60)
+        ax.set_ylim(-0.1, 1.9)
+        ax.set_yticks([1.4, 0.4], ['Ground truth', 'Prediction'])
+        ax.set_facecolor(SURFACE)
+        for side in ('top', 'right', 'left'):
+            ax.spines[side].set_visible(False)
+        ax.spines['bottom'].set_color(BASELINE)
+        ax.tick_params(colors=INK_MUTED, labelcolor=INK_SECONDARY, length=0)
+    axes[-1].set_xlabel('time (min)', color=INK_SECONDARY)
+    fig.suptitle(title, x=0.01, ha='left', color=INK_PRIMARY, fontsize=12, fontweight='bold')
+    fig.legend(handles=[Patch(facecolor=color, label=name) for name, color in zip(class_names, class_colors)],
+               loc='outside lower center', ncol=4, frameon=False, labelcolor=INK_SECONDARY, fontsize=9)
+    fig.savefig(path, dpi=200, facecolor=SURFACE)

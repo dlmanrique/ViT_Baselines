@@ -1,6 +1,7 @@
 Datasets
 outputs/
 pycache/
+wandb/
 *.pyc
 *.pt
 *.pth
