@@ -1,6 +1,6 @@
 """
-Evaluation metrics for the frame-wise SAR-RARP50 tasks. compute_metrics picks
-the metric set from the task type:
+Evaluation metrics for the frame-wise tasks. compute_metrics picks the metric
+set from the task type:
 
 multiclass (gesture recognition)
     Frame-wise metrics pool all frames of a split: accuracy, balanced accuracy,
@@ -21,14 +21,30 @@ binary (error detection)
     specificity and F1 of the error class, per-class scores, the confusion
     matrix and per-video scores.
 
+multilabel (CholecT45 triplet recognition)
+    Video-wise average precision, the official CholecT45/CholecT50 metric, as
+    in ivtmetrics Recognition.compute_video_AP
+    (github.com/CAMMA-public/ivtmetrics): the AP of every class is computed
+    within each video, a class without positive frames in a video is NaN
+    there, the per-class APs are averaged over videos skipping NaN, and the mAP
+    is the mean over the classes (classes absent from every video are skipped).
+    Instrument (i), verb (v), target (t), instrument-verb (iv) and
+    instrument-target (it) scores are disentangled from the 100 triplet (ivt)
+    scores with the max over the triplets sharing the component, as in
+    ivtmetrics Disentangle. The main metric is ap_ivt.
+
 All metrics are fractions in [0, 1].
 """
+
+import warnings
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 F1_OVERLAPS = (0.10, 0.25, 0.50)
+# Triplet metric components and their column in the component map of utils.load_triplet_dict
+TRIPLET_COMPONENTS = {'ivt': 0, 'i': 1, 'v': 2, 't': 3, 'iv': 4, 'it': 5}
 
 
 def confusion_matrix(labels, preds, num_classes):
@@ -134,21 +150,26 @@ def per_video_metrics(video_ids, frame_ids, labels, preds):
     return pd.DataFrame(rows)
 
 
-def compute_metrics(task_type, video_ids, frame_ids, labels, probs, class_names):
-    """Compute every metric of one split for a 'multiclass' or 'binary' task.
+def compute_metrics(task_type, video_ids, frame_ids, labels, probs, class_names, component_map=None):
+    """Compute every metric of one split for a 'multiclass', 'binary' or 'multilabel' task.
 
-    probs is the (num_frames x num_classes) array of class probabilities; the
-    predicted class is its argmax and, for binary tasks, the score of the
-    positive class is probs[:, 1].
+    probs is the (num_frames x num_classes) array of class probabilities. For
+    the single-label tasks labels are class ids, the predicted class is the
+    argmax of probs and, for binary tasks, the score of the positive class is
+    probs[:, 1]. For multilabel tasks labels is the (num_frames x num_classes)
+    multi-hot matrix and component_map the triplet component ids
+    (utils.load_triplet_dict).
 
     Returns a dict with:
         scalars:          {metric name: float}
-        per_class:        DataFrame with precision, recall, F1 and support per class.
+        per_class:        DataFrame with the per-class scores and support.
         per_video:        DataFrame with the per-video metrics.
-        confusion_matrix: (num_classes x num_classes) array.
+        confusion_matrix: (num_classes x num_classes) array (single-label tasks only).
     """
-    labels = np.asarray(labels, dtype=np.int64)
     probs = np.asarray(probs)
+    if task_type == 'multilabel':
+        return multilabel_metrics(video_ids, np.asarray(labels), probs, class_names, component_map)
+    labels = np.asarray(labels, dtype=np.int64)
     preds = probs.argmax(axis=1)
     if task_type == 'binary':
         return binary_metrics(video_ids, labels, preds, probs[:, 1], class_names)
@@ -220,3 +241,66 @@ def multiclass_metrics(video_ids, frame_ids, labels, preds, class_names):
 
     per_class_df = pd.DataFrame({'class_id': range(num_classes), 'class_name': class_names, **per_class})
     return {'scalars': scalars, 'per_class': per_class_df, 'per_video': per_video, 'confusion_matrix': cm}
+
+
+def disentangle(scores, component_map, column):
+    """Return the (num_frames x num_component_classes) scores of one component of (num_frames x 100) triplet scores.
+
+    Each component class gets the max over the triplets that contain it, as in
+    ivtmetrics Disentangle; columns follow the component ids in increasing order.
+    """
+    ids = component_map[:, column]
+    return np.stack([scores[:, ids == c].max(axis=1) for c in np.unique(ids)], axis=1)
+
+
+def videowise_ap(video_ids, labels, scores):
+    """Return (per-class AP averaged over videos, (num_videos x num_classes) per-video AP), videos sorted by id.
+
+    As in ivtmetrics compute_video_AP: the AP of a class is NaN in a video
+    without positive frames of that class and the average over videos skips it,
+    so a class absent from every video stays NaN.
+    """
+    rows = []
+    for video_id in np.unique(video_ids):
+        mask = video_ids == video_id
+        y, s = labels[mask], scores[mask]
+        ap = np.full(y.shape[1], np.nan)
+        for c in np.flatnonzero(y.any(axis=0)):
+            ap[c] = average_precision_score(y[:, c], s[:, c])
+        rows.append(ap)
+    per_video = np.stack(rows)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)  # mean of an all-NaN column
+        return np.nanmean(per_video, axis=0), per_video
+
+
+def multilabel_metrics(video_ids, labels, probs, class_names, component_map):
+    """Metrics of multi-label triplet recognition: video-wise AP of the triplets and of their components.
+
+    scalars has ap_<component> for ivt, i, v, t, iv and it (mean over the
+    classes of the video-wise AP); per_class has the video-wise AP, positive
+    frames and videos of each triplet; per_video has the mAP of every component
+    in each video.
+    """
+    video_ids = np.asarray(video_ids)
+    videos = np.unique(video_ids)
+    scalars = {}
+    per_video = {'video_id': videos, 'num_frames': [int((video_ids == v).sum()) for v in videos]}
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=RuntimeWarning)  # mean of an all-NaN slice
+        for component, column in TRIPLET_COMPONENTS.items():
+            classwise, video_ap = videowise_ap(video_ids, disentangle(labels, component_map, column),
+                                               disentangle(probs, component_map, column))
+            scalars[f'ap_{component}'] = float(np.nanmean(classwise))
+            per_video[f'ap_{component}'] = np.nanmean(video_ap, axis=1)
+            if component == 'ivt':
+                triplet_ap = classwise
+
+    per_class = pd.DataFrame({
+        'class_id': range(len(class_names)),
+        'class_name': class_names,
+        'ap': triplet_ap,
+        'positive_frames': labels.sum(axis=0).astype(np.int64),
+        'videos': np.stack([labels[video_ids == v].any(axis=0) for v in videos]).sum(axis=0),
+    })
+    return {'scalars': scalars, 'per_class': per_class, 'per_video': pd.DataFrame(per_video)}

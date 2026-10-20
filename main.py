@@ -1,15 +1,24 @@
 """
-Frame-wise ViT baseline for SAR-RARP50, for the task selected with --task:
-    gesture_recognition   8 gesture classes at 10 Hz (multiclass metrics)
-    error_detection       normal / error at 5 Hz (binary metrics: AUC, AP, ...)
+Frame-wise ViT baseline for the task selected with --task:
+    gesture_recognition   SAR-RARP50, 8 gesture classes at 10 Hz (multiclass metrics)
+    error_detection       SAR-RARP50, normal / error at 5 Hz (binary metrics: AUC, AP, ...)
+    triplet_recognition   CholecT45, 100 <instrument, verb, target> triplets at 1 fps, multi-label
+                          (video-wise AP of ivtmetrics); one run per cross-validation fold (--fold)
 
 Each annotated frame is classified on its own by an ImageNet-pretrained ViT
-from timm, fine-tuned end to end with cross-entropy on the train split. The
+from timm, fine-tuned end to end on the train split with cross-entropy, or
+with binary cross-entropy over the 100 triplets for the multi-label task. The
 checkpoint with the best validation monitor metric of the task (frame-wise
-accuracy for gestures, AP for errors) is then evaluated on the test split.
+accuracy for gestures, AP for errors, AP_IVT for triplets) is then evaluated
+on the test split. Triplet recognition follows the official CholecT45 5-fold
+cross-validation: --fold k is the test split, 5 videos of the other folds
+are the validation split and the remaining 31 videos are trained on; the
+paper results are the mean and std of the test AP over the 5 folds.
 
 Training logs everything to Weights & Biases, in a run named after its start
-date and time (YYYY-MM-DD_HH-MM-SS):
+date and time and its task (YYYY-MM-DD_HH-MM-SS_<task>, plus _fold<k> for
+triplet recognition), tagged with the task (and fold) and placed in the
+--wandb_group group if given (run_triplet_cv.sh groups its 5 folds):
     train/loss, train/lr          every --log_every steps
     train_epoch/*, val/*          every epoch (loss, all metrics of the task,
     val_class_f1/*                per-class F1 and val/best_<monitor> so far)
@@ -21,15 +30,16 @@ next to the local wandb run folder (<output_dir>/wandb).
 Sweeps: the arguments are read back from wandb.config after wandb.init, so a
 `wandb agent` can override any of them (e.g. --lr). Use val/best_<monitor> as
 the sweep metric (goal: maximize): val/best_accuracy for gestures, val/best_ap
-for errors.
+for errors, val/best_ap_ivt for triplets.
 
 Inference (--eval_only): loads the ViT in --checkpoint, evaluates it on the val
-and test splits of --task and prints every metric of the task in the terminal.
-Nothing is logged to wandb and no file is written.
+and test splits of --task (and --fold) and prints every metric of the task in
+the terminal. Nothing is logged to wandb and no file is written.
 
 Usage (from any folder, Base_Leo environment):
     python main.py --task gesture_recognition            # training, after `wandb login`
     python main.py --task error_detection --epochs 30 --lr 1e-4
+    python main.py --task triplet_recognition --fold 1   # repeat for folds 1..5
     python main.py --eval_only --task error_detection --checkpoint outputs/<run name>/best.pt
 """
 
@@ -48,10 +58,11 @@ import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
-from metrics import compute_metrics
+from metrics import TRIPLET_COMPONENTS, compute_metrics
 from models.vit import build_vit, vit_data_config
 from utils import (SPLITS, TASKS, FrameDataset, build_loader, build_transforms, check_frames, class_weights,
-                   find_frame_dirs, load_split, param_groups, parse_args, plot_timelines, set_seed, warmup_cosine)
+                   find_frame_dirs, load_cholect45_split, load_split, param_groups, parse_args, plot_timelines,
+                   resolve_task, set_seed, split_labels, warmup_cosine)
 
 NUM_PLOT_VIDEOS = 3  # random test videos drawn in the inference timeline plot
 
@@ -59,10 +70,11 @@ NUM_PLOT_VIDEOS = 3  # random test videos drawn in the inference timeline plot
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, amp, grad_clip, epoch, log_every, step):
     """Train for one epoch, logging the loss to wandb every log_every steps.
 
-    Returns the mean training loss and accuracy of the epoch and the global step.
+    Returns the mean training loss of the epoch, its frame accuracy (None for
+    multi-label targets) and the global step.
     """
     model.train()
-    total_loss, correct, seen = 0.0, 0, 0
+    total_loss, correct, seen, multilabel = 0.0, 0, 0, False
     window_loss, window_steps = 0.0, 0
     for images, labels in tqdm(loader, desc=f'train {epoch}', leave=False):
         images = images.to(device, non_blocking=True)
@@ -81,7 +93,9 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, amp,
 
         loss_value = loss.item()
         total_loss += loss_value * len(labels)
-        correct += (logits.argmax(dim=1) == labels).sum().item()
+        multilabel = labels.ndim == 2
+        if not multilabel:
+            correct += (logits.argmax(dim=1) == labels).sum().item()
         seen += len(labels)
         window_loss += loss_value
         window_steps += 1
@@ -89,43 +103,61 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, amp,
             wandb.log({'step': step, 'train/loss': window_loss / window_steps,
                        'train/lr': scheduler.get_last_lr()[0]})
             window_loss, window_steps = 0.0, 0
-    return total_loss / seen, correct / seen, step
+    return total_loss / seen, None if multilabel else correct / seen, step
 
 
 @torch.no_grad()
-def predict(model, loader, device, amp, desc):
-    """Return the class probabilities (num_frames x num_classes) of every frame, in loader order."""
+def predict(model, loader, device, amp, desc, multilabel):
+    """Return the class probabilities (num_frames x num_classes) of every frame, in loader order.
+
+    Softmax over the classes, or an independent sigmoid per class for multi-label tasks.
+    """
     model.eval()
     probs = []
     for images, _ in tqdm(loader, desc=desc, leave=False):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-            logits = model(images.to(device, non_blocking=True))
-        probs.append(logits.float().softmax(dim=1).cpu())
+            logits = model(images.to(device, non_blocking=True)).float()
+        probs.append((logits.sigmoid() if multilabel else logits.softmax(dim=1)).cpu())
     return torch.cat(probs).numpy()
 
 
 def evaluate(model, loader, df, device, amp, split, task):
-    """Predict a split and return (cross-entropy loss, metrics dict of the task type, class probabilities)."""
-    probs = predict(model, loader, device, amp, split)
-    labels = df['annotation'].to_numpy()
-    loss = float(-np.log(probs[np.arange(len(labels)), labels] + 1e-12).mean())
-    metrics = compute_metrics(task['type'], df['video_id'], df['frame_id'], labels, probs, task['class_names'])
+    """Predict a split and return (loss, metrics dict of the task type, class probabilities).
+
+    The loss is the cross-entropy of the true class, or for multi-label tasks
+    the binary cross-entropy averaged over frames and classes.
+    """
+    multilabel = task['type'] == 'multilabel'
+    probs = predict(model, loader, device, amp, split, multilabel)
+    labels = split_labels(df, task)
+    if multilabel:
+        p = np.clip(probs.astype(np.float64), 1e-12, 1 - 1e-12)
+        loss = float(-(labels * np.log(p) + (1 - labels) * np.log(1 - p)).mean())
+    else:
+        loss = float(-np.log(probs[np.arange(len(labels)), labels] + 1e-12).mean())
+    metrics = compute_metrics(task['type'], df['video_id'], df['frame_id'], labels, probs, task['class_names'],
+                              task.get('component_map'))
     return loss, metrics, probs
 
 
 def load_data(args, task, split_names):
-    """Find the frame folders and load and check the requested splits of the task.
+    """Load and check the requested splits of the task.
 
-    Returns ({video_id: frames folder}, {split: DataFrame}).
+    Returns {split: DataFrame} with the video_id, frame_id, image path and labels of every frame.
     """
-    splits_dir = args.splits_dir or task['splits_dir']
-    frame_dirs = find_frame_dirs(args.sar_root)
+    if task['dataset'] == 'sarrarp50':
+        splits_dir = args.splits_dir or task['splits_dir']
+        frame_dirs = find_frame_dirs(args.sar_root)
     splits = {}
     for split in split_names:
-        splits[split] = load_split(splits_dir, task, split)
-        check_frames(splits[split], frame_dirs)
-        print(f'{split}: {len(splits[split])} frames from {splits[split]["video_id"].nunique()} videos')
-    return frame_dirs, splits
+        if task['dataset'] == 'cholect45':
+            splits[split] = load_cholect45_split(args.cholect_root, args.fold, split)
+        else:
+            splits[split] = load_split(splits_dir, task, split, frame_dirs)
+        check_frames(splits[split])
+        videos = splits[split]['video_id'].unique()
+        print(f'{split}: {len(splits[split])} frames from {len(videos)} videos ({", ".join(videos)})')
+    return splits
 
 
 def log_split_results(run, prefix, loss, metrics):
@@ -143,6 +175,9 @@ def log_split_results(run, prefix, loss, metrics):
 
 def format_metrics(scalars, task_type):
     """Return the main metrics of a split as one console string."""
+    if task_type == 'multilabel':
+        return ' | '.join(f'AP_{component.upper()} {scalars[f"ap_{component}"]:.4f}'
+                          for component in TRIPLET_COMPONENTS)
     if task_type == 'binary':
         return (f"AUC {scalars['auc']:.4f} | AP {scalars['ap']:.4f} | acc {scalars['accuracy']:.4f} | "
                 f"precision {scalars['precision']:.4f} recall {scalars['recall']:.4f} F1 {scalars['f1']:.4f}")
@@ -152,7 +187,7 @@ def format_metrics(scalars, task_type):
 
 
 def print_split_results(split, loss, metrics, class_names):
-    """Print every metric of a split: scalars, per-class and per-video tables and the confusion matrix."""
+    """Print every metric of a split: scalars, per-class and per-video tables and the confusion matrix (if any)."""
     print(f'\n{"=" * 30} {split} {"=" * 30}')
     for name, value in {'loss': loss, **metrics['scalars']}.items():
         print(f'{name:<20}{value:.4f}')
@@ -160,20 +195,23 @@ def print_split_results(split, loss, metrics, class_names):
     print(metrics['per_class'].to_string(index=False, float_format='%.4f'))
     print('\nPer video:')
     print(metrics['per_video'].to_string(index=False, float_format='%.4f'))
-    print('\nConfusion matrix (rows: ground truth, columns: predicted class id):')
-    print(pd.DataFrame(metrics['confusion_matrix'], index=[f'{c} {name}' for c, name in enumerate(class_names)],
-                       columns=range(len(class_names))).to_string())
+    if 'confusion_matrix' in metrics:
+        print('\nConfusion matrix (rows: ground truth, columns: predicted class id):')
+        print(pd.DataFrame(metrics['confusion_matrix'], index=[f'{c} {name}' for c, name in enumerate(class_names)],
+                           columns=range(len(class_names))).to_string())
 
 
 def run_inference(args):
     """Evaluate the ViT in --checkpoint on the val and test splits of --task and print the metrics."""
-    task = TASKS[args.task]
+    task = resolve_task(args)
     class_names = task['class_names']
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     trained_args = checkpoint['args']
     trained_task = trained_args.get('task', 'gesture_recognition')  # checkpoints saved before --task existed
     if trained_task != args.task:
         raise ValueError(f'{args.checkpoint} was trained for {trained_task}, not for {args.task}')
+    if task['dataset'] == 'cholect45' and trained_args['fold'] != args.fold:
+        raise ValueError(f'{args.checkpoint} was trained with test fold {trained_args["fold"]}, not --fold {args.fold}')
 
     device = torch.device(args.device)
     amp = not args.no_amp and device.type == 'cuda'
@@ -189,10 +227,10 @@ def run_inference(args):
     print(f'Task {args.task} | model {trained_args["model"]} | epoch {checkpoint["epoch"]} | '
           f'val {monitor} during training {checkpoint["val_metrics"][monitor]:.4f}')
 
-    frame_dirs, splits = load_data(args, task, ('val', 'test'))
+    splits = load_data(args, task, ('val', 'test'))
     for split, df in splits.items():
-        loader = build_loader(FrameDataset(df, frame_dirs, eval_transform), args.eval_batch_size, train=False,
-                              num_workers=args.num_workers, seed=args.seed)
+        loader = build_loader(FrameDataset(df, split_labels(df, task), eval_transform), args.eval_batch_size,
+                              train=False, num_workers=args.num_workers, seed=args.seed)
         loss, metrics, probs = evaluate(model, loader, df, device, amp, split, task)
         print_split_results(split, loss, metrics, class_names)
 
@@ -208,9 +246,13 @@ def run_training(args):
     """Train the frame-wise ViT on --task, keep the best checkpoint and evaluate it, logging everything to wandb."""
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
-    run_name = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    run = wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=run_name, config=vars(args),
-                     mode=args.wandb_mode, dir=output_dir, job_type='train')
+    run_name = f'{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.task}'
+    tags = [args.task]
+    if TASKS[args.task]['dataset'] == 'cholect45':
+        run_name += f'_fold{args.fold}'
+        tags.append(f'fold{args.fold}')
+    run = wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=run_name, group=args.wandb_group,
+                     tags=tags, config=vars(args), mode=args.wandb_mode, dir=output_dir, job_type='train')
     args = argparse.Namespace(**dict(run.config))  # a sweep agent may have overridden some arguments
     wandb.define_metric('step')
     wandb.define_metric('train/*', step_metric='step')
@@ -219,8 +261,9 @@ def run_training(args):
         wandb.define_metric(f'{prefix}/*', step_metric='epoch')
     print(f'wandb run {run_name} ({run.id})')
 
-    task = TASKS[args.task]
+    task = resolve_task(args)
     class_names, monitor = task['class_names'], task['monitor']
+    multilabel = task['type'] == 'multilabel'
     set_seed(args.seed)
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')
@@ -228,7 +271,7 @@ def run_training(args):
     amp = not args.no_amp and device.type == 'cuda'
 
     # Data
-    frame_dirs, splits = load_data(args, task, SPLITS)
+    splits = load_data(args, task, SPLITS)
 
     # Model and loaders
     model = build_vit(args.model, len(class_names), pretrained=not args.no_pretrained, img_size=args.img_size,
@@ -237,7 +280,8 @@ def run_training(args):
     train_transform, eval_transform = build_transforms(args.img_size, data_config, args.crop_scale_min,
                                                        args.color_jitter)
     loaders = {
-        split: build_loader(FrameDataset(df, frame_dirs, train_transform if split == 'train' else eval_transform),
+        split: build_loader(FrameDataset(df, split_labels(df, task),
+                                         train_transform if split == 'train' else eval_transform),
                             args.batch_size if split == 'train' else args.eval_batch_size,
                             train=split == 'train', num_workers=args.num_workers, seed=args.seed)
         for split, df in splits.items()
@@ -246,6 +290,7 @@ def run_training(args):
         'data_config': data_config,
         'num_frames': {split: len(df) for split, df in splits.items()},
         'num_videos': {split: int(df['video_id'].nunique()) for split, df in splits.items()},
+        'videos': {split: df['video_id'].unique().tolist() for split, df in splits.items()},
         'torch_version': torch.__version__,
         'timm_version': timm.__version__,
         'cuda_device': torch.cuda.get_device_name(device) if device.type == 'cuda' else None,
@@ -255,11 +300,14 @@ def run_training(args):
           f'mean {data_config["mean"]} std {data_config["std"]}')
 
     # Optimization
-    weights = class_weights(splits['train']['annotation'].to_numpy(), len(class_names), args.class_weighting)
-    if weights is not None:
-        print(f'Class weights ({args.class_weighting}): {np.round(weights.numpy(), 3).tolist()}')
-        weights = weights.to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=args.label_smoothing)
+    if multilabel:
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        weights = class_weights(splits['train']['annotation'].to_numpy(), len(class_names), args.class_weighting)
+        if weights is not None:
+            print(f'Class weights ({args.class_weighting}): {np.round(weights.numpy(), 3).tolist()}')
+            weights = weights.to(device)
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.AdamW(param_groups(model, args.weight_decay), lr=args.lr)
     steps_per_epoch = len(loaders['train'])
     scheduler = LambdaLR(optimizer, warmup_cosine(args.epochs * steps_per_epoch,
@@ -283,16 +331,20 @@ def run_training(args):
             torch.save({'model': model.state_dict(), 'epoch': epoch, 'val_metrics': scalars, 'args': vars(args),
                         'wandb_run': run_name, 'wandb_id': run.id}, best_path)
 
+        # The 100 per-triplet APs are only logged in the final per-class tables
+        class_f1 = ({} if multilabel else
+                    {f'val_class_f1/{row.class_name}': row.f1 for row in val_metrics['per_class'].itertuples()})
         wandb.log({
             'epoch': epoch,
             'train_epoch/loss': train_loss,
-            'train_epoch/accuracy': train_acc,
+            **({} if train_acc is None else {'train_epoch/accuracy': train_acc}),
             'val/loss': val_loss,
             **{f'val/{name}': value for name, value in scalars.items()},
             f'val/best_{monitor}': best_value,
-            **{f'val_class_f1/{row.class_name}': row.f1 for row in val_metrics['per_class'].itertuples()},
+            **class_f1,
         })
-        print(f'epoch {epoch}/{args.epochs} | train loss {train_loss:.4f} acc {train_acc:.4f} | '
+        train_acc_text = '' if train_acc is None else f' acc {train_acc:.4f}'
+        print(f'epoch {epoch}/{args.epochs} | train loss {train_loss:.4f}{train_acc_text} | '
               f'val loss {val_loss:.4f} | {format_metrics(scalars, task["type"])} | {time.time() - start:.0f}s'
               + (f' | new best {monitor}' if is_best else ''))
 

@@ -1,14 +1,18 @@
 """
-Shared code for the frame-wise ViT baselines on SAR-RARP50.
+Shared code for the frame-wise ViT baselines on SAR-RARP50 and CholecT45.
 
 - Command line arguments (parse_args) and default paths.
-- Task registry (TASKS): split folder, CSV name and class names of each task
-  selected with --task.
-- Frame dataset: one sample per annotated frame, read from the JPEGs
-  written by SAR-RARP50/extract_frames_sarrarp50.py
-  (<video_dir>/frames/<frame_id:09d>.jpg).
-- Image transforms, data loaders, class weights, optimizer parameter groups,
-  LR schedule and seeding.
+- Task registry (TASKS): dataset, split folder, CSV name, metric type and
+  class names of each task selected with --task.
+- Split loading: one row per annotated frame with its video, frame id, image
+  path and labels.
+    SAR-RARP50: split CSVs of preprocess_sarrarp50 and the JPEGs written by
+      SAR-RARP50/extract_frames_sarrarp50.py (<video_dir>/frames/<frame_id:09d>.jpg).
+    CholecT45: the 45 CholecT45 videos of the official CholecT50 release
+      (<cholect_root>/data/VIDxx/<frame_id:06d>.png, multi-hot labels in
+      triplet/VIDxx.txt), split by the official 5-fold cross-validation.
+- Frame dataset, image transforms, data loaders, class weights, optimizer
+  parameter groups, LR schedule and seeding.
 - Timeline plot of ground-truth vs predicted classes per video (inference).
 
 Default paths are resolved from this file's folder (ViT_Baselines/), so the
@@ -34,16 +38,19 @@ from metrics import segment_intervals
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SAR_ROOT = os.path.join(SCRIPT_DIR, 'Datasets', 'SAR-RARP50')
 PREPROCESS_DIR = os.path.join(SCRIPT_DIR, 'Datasets', 'preprocess_sarrarp50')
+DEFAULT_CHOLECT_ROOT = os.path.join(SCRIPT_DIR, 'Datasets', 'CholecT50')
 DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'outputs')
 
 # One entry per task:
-#   splits_dir   folder with the split CSVs ({split}_sarrarp50_{csv_suffix}.csv)
-#   type         metric set of metrics.compute_metrics ('multiclass' or 'binary')
+#   dataset      'sarrarp50' or 'cholect45'
+#   splits_dir   (sarrarp50) folder with the split CSVs ({split}_sarrarp50_{csv_suffix}.csv)
+#   type         metric set of metrics.compute_metrics ('multiclass', 'binary' or 'multilabel')
 #   monitor      validation metric that selects the best checkpoint
-#   class_names  index = annotation value
+#   class_names  index = annotation value (None: read from the dataset by resolve_task)
 #   class_colors (optional) one color per class; enables the test timeline plot of the inference
 TASKS = {
     'gesture_recognition': {
+        'dataset': 'sarrarp50',
         'splits_dir': os.path.join(PREPROCESS_DIR, 'gesture_recognition'),
         'csv_suffix': 'gestures',
         'type': 'multiclass',
@@ -64,16 +71,37 @@ TASKS = {
         'class_colors': ['#898781', '#eda100', '#008300', '#e87ba4', '#2a78d6', '#eb6834', '#1baf7a', '#6250d6'],
     },
     'error_detection': {
+        'dataset': 'sarrarp50',
         'splits_dir': os.path.join(PREPROCESS_DIR, 'error_detection'),
         'csv_suffix': 'errors',
         'type': 'binary',
         'monitor': 'ap',
         'class_names': ['Normal', 'Error'],
     },
+    'triplet_recognition': {
+        'dataset': 'cholect45',
+        'type': 'multilabel',
+        'monitor': 'ap_ivt',
+        'class_names': None,  # the 100 <instrument,verb,target> triplets of <cholect_root>/dict/triplet.txt
+    },
 }
 SPLITS = ('train', 'val', 'test')
 FRAMES_DIR = 'frames'
-FRAME_ASPECT = 16 / 9  # extracted frames are 960x540
+FRAME_ASPECT = 16 / 9  # SAR-RARP50 frames are 960x540 and CholecT50 frames 854x480
+
+# Official CholecT45 5-fold cross-validation (Nwoye & Padoy 2022, arXiv 2204.05235), in the order of the
+# official CAMMA data loader (github.com/CAMMA-public/cholect45, dataloader_pth.py): --fold k is the test
+# split, the other folds are concatenated in key order and their last NUM_VAL_VIDEOS videos are validation.
+CHOLECT45_FOLDS = {
+    1: [79, 2, 51, 6, 25, 14, 66, 23, 50],
+    2: [80, 32, 5, 15, 40, 47, 26, 48, 70],
+    3: [31, 57, 36, 18, 52, 68, 10, 8, 73],
+    4: [42, 29, 60, 27, 65, 75, 22, 49, 12],
+    5: [78, 43, 62, 35, 74, 1, 56, 4, 13],
+}
+NUM_VAL_VIDEOS = 5
+NUM_TRIPLETS = 100
+TRIPLET_COLUMNS = [f'tri{i}' for i in range(NUM_TRIPLETS)]
 VIDEO_FPS = 60  # frame_id is the frame index in the 60 fps video_left.avi
 
 # Plot styling (same tokens as the preprocess_sarrarp50 figures)
@@ -91,15 +119,21 @@ BASELINE = '#c3c2b7'
 def parse_args(argv=None):
     """Parse the command line arguments of main.py."""
     parser = argparse.ArgumentParser(
-        description='Frame-wise ViT (ImageNet weights) for SAR-RARP50: training or inference (--eval_only).')
+        description='Frame-wise ViT (ImageNet weights) for SAR-RARP50 and CholecT45: training or inference '
+                    '(--eval_only).')
 
     data = parser.add_argument_group('data')
     data.add_argument('--task', choices=list(TASKS), default='gesture_recognition',
-                      help='Task: selects the split CSVs and the class names.')
+                      help='Task: selects the dataset, the splits and the class names.')
     data.add_argument('--sar_root', default=DEFAULT_SAR_ROOT,
                       help='SAR-RARP50 root containing <split>/video_xx/frames/*.jpg.')
     data.add_argument('--splits_dir', default=None,
-                      help="Folder with the task's {train,val,test} CSVs (default: preprocess_sarrarp50/<task>).")
+                      help="SAR-RARP50 tasks: folder with the task's {train,val,test} CSVs "
+                           "(default: preprocess_sarrarp50/<task>).")
+    data.add_argument('--cholect_root', default=DEFAULT_CHOLECT_ROOT,
+                      help='triplet_recognition: CholecT50 release root (data/, triplet/, dict/).')
+    data.add_argument('--fold', type=int, choices=sorted(CHOLECT45_FOLDS), default=1,
+                      help='triplet_recognition: CholecT45 cross-validation fold used as test split.')
     data.add_argument('--num_workers', type=int, default=8, help='Data loader worker processes.')
 
     model = parser.add_argument_group('model')
@@ -146,13 +180,25 @@ def parse_args(argv=None):
                                help='wandb user or team that owns the project (default: personal account).')
     logging_group.add_argument('--wandb_mode', choices=['online', 'offline', 'disabled'], default='online',
                                help='"disabled" runs without wandb, e.g. for a quick code test.')
+    logging_group.add_argument('--wandb_group', default=None,
+                               help='wandb group of the run, e.g. one name shared by the 5 folds of a cross-validation.')
 
     args = parser.parse_args(argv)
     if args.eval_only and not args.checkpoint:
         parser.error('--eval_only requires --checkpoint')
     if not 0 < args.crop_scale_min <= 1:
         parser.error('--crop_scale_min must be in (0, 1]')
+    if TASKS[args.task]['type'] == 'multilabel' and (args.class_weighting != 'none' or args.label_smoothing > 0):
+        parser.error('--class_weighting and --label_smoothing only apply to the cross-entropy tasks')
     return args
+
+
+def resolve_task(args):
+    """Return a copy of TASKS[args.task]; triplet recognition gets its class names and component map from the dataset."""
+    task = dict(TASKS[args.task])
+    if task['dataset'] == 'cholect45':
+        task['class_names'], task['component_map'] = load_triplet_dict(args.cholect_root)
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +220,11 @@ def find_frame_dirs(sar_root):
     return frame_dirs
 
 
-def load_split(splits_dir, task, split):
-    """Read {split}_sarrarp50_{csv_suffix}.csv of a task (video_id, frame_id, annotation), sorted by video and frame.
+def load_split(splits_dir, task, split, frame_dirs):
+    """Read {split}_sarrarp50_{csv_suffix}.csv of a SAR-RARP50 task (video_id, frame_id, annotation).
 
-    task is an entry of TASKS.
+    task is an entry of TASKS. Adds the path of every frame JPEG and returns the
+    rows sorted by video and frame.
     """
     path = os.path.join(splits_dir, f"{split}_sarrarp50_{task['csv_suffix']}.csv")
     num_classes = len(task['class_names'])
@@ -185,29 +232,97 @@ def load_split(splits_dir, task, split):
     invalid = ~df['annotation'].between(0, num_classes - 1)
     if invalid.any():
         raise ValueError(f'{path}: {int(invalid.sum())} rows with a label outside [0, {num_classes - 1}]')
-    return df.sort_values(['video_id', 'frame_id']).reset_index(drop=True)
-
-
-def check_frames(df, frame_dirs):
-    """Raise if a video of df has no frames folder or a frame JPEG is missing."""
     missing_videos = sorted(set(df['video_id']) - set(frame_dirs))
     if missing_videos:
         raise FileNotFoundError(f'No frames folder for videos {missing_videos}')
+    df['path'] = [os.path.join(frame_dirs[video_id], f'{frame_id:09d}.jpg')
+                  for video_id, frame_id in zip(df['video_id'], df['frame_id'])]
+    return df.sort_values(['video_id', 'frame_id']).reset_index(drop=True)
+
+
+def cholect45_videos(fold, split):
+    """Return the video ids (VIDxx) of a split of the CholecT45 cross-validation whose test split is fold."""
+    if split == 'test':
+        videos = CHOLECT45_FOLDS[fold]
+    else:
+        trainval = sum([videos for k, videos in CHOLECT45_FOLDS.items() if k != fold], [])
+        videos = trainval[-NUM_VAL_VIDEOS:] if split == 'val' else trainval[:-NUM_VAL_VIDEOS]
+    return [f'VID{video:02d}' for video in videos]
+
+
+def load_cholect45_split(cholect_root, fold, split):
+    """Read a split of the CholecT45 cross-validation from the official triplet labels.
+
+    Every row of <cholect_root>/triplet/VIDxx.txt (frame id, then 100 binary
+    triplet labels) is a sample, as in the official loader. Returns video_id,
+    frame_id, path (data/VIDxx/<frame_id:06d>.png) and the multi-hot columns
+    tri0..tri99, sorted by video and frame.
+    """
+    videos = []
+    for video_id in cholect45_videos(fold, split):
+        path = os.path.join(cholect_root, 'triplet', f'{video_id}.txt')
+        rows = np.loadtxt(path, dtype=np.int64, delimiter=',', ndmin=2)
+        if rows.shape[1] != NUM_TRIPLETS + 1 or not np.isin(rows[:, 1:], (0, 1)).all():
+            raise ValueError(f'{path}: expected a frame id and {NUM_TRIPLETS} binary labels per row')
+        video = pd.DataFrame(rows[:, 1:], columns=TRIPLET_COLUMNS)
+        video.insert(0, 'video_id', video_id)
+        video.insert(1, 'frame_id', rows[:, 0])
+        video.insert(2, 'path', [os.path.join(cholect_root, 'data', video_id, f'{frame_id:06d}.png')
+                                 for frame_id in rows[:, 0]])
+        videos.append(video)
+    return pd.concat(videos, ignore_index=True).sort_values(['video_id', 'frame_id']).reset_index(drop=True)
+
+
+def load_triplet_dict(cholect_root):
+    """Return the triplet names and the (100 x 6) triplet component map of <cholect_root>/dict.
+
+    Names are 'instrument,verb,target' (dict/triplet.txt). The map rows are
+    triplet ids 0..99 and its columns the triplet, instrument, verb, target,
+    instrument-verb and instrument-target ids (dict/maps.txt, the mapping that
+    ivtmetrics uses to disentangle the components); the null row (-1) is dropped.
+    """
+    names = {}
+    with open(os.path.join(cholect_root, 'dict', 'triplet.txt')) as f:
+        for line in f:
+            if line.strip():
+                triplet_id, name = line.strip().split(':', 1)
+                names[int(triplet_id)] = name
+    component_map = np.loadtxt(os.path.join(cholect_root, 'dict', 'maps.txt'), dtype=np.int64, delimiter=',',
+                               comments='#', ndmin=2)
+    component_map = component_map[component_map[:, 0] >= 0]
+    component_map = component_map[np.argsort(component_map[:, 0])]
+    if not np.array_equal(component_map[:, 0], np.arange(NUM_TRIPLETS)):
+        raise ValueError(f'{cholect_root}/dict/maps.txt does not map the triplet ids 0..{NUM_TRIPLETS - 1}')
+    return [names[i] for i in range(NUM_TRIPLETS)], component_map
+
+
+def split_labels(df, task):
+    """Return the labels of a split: class ids, or the (num_frames x 100) multi-hot matrix of a multilabel task.
+
+    np.array copies: with pandas copy-on-write, to_numpy returns a read-only
+    view and the data loader would build non-writable label tensors from it.
+    """
+    if task['type'] == 'multilabel':
+        return np.array(df[TRIPLET_COLUMNS], dtype=np.float32)
+    return np.array(df['annotation'], dtype=np.int64)
+
+
+def check_frames(df):
+    """Raise if the image file of a row of df is missing (one folder listing per video)."""
     missing = []
-    for video_id, video in df.groupby('video_id'):
-        available = set(os.listdir(frame_dirs[video_id]))
-        missing += [f'{video_id}/{f:09d}.jpg' for f in video['frame_id'] if f'{f:09d}.jpg' not in available]
+    for folder, paths in df.groupby(df['path'].map(os.path.dirname))['path']:
+        available = set(os.listdir(folder)) if os.path.isdir(folder) else set()
+        missing += [path for path in paths if os.path.basename(path) not in available]
     if missing:
         raise FileNotFoundError(f'{len(missing)} frames missing, e.g. {missing[:5]}')
 
 
 class FrameDataset(Dataset):
-    """One sample per row of a split CSV: (transformed frame, annotation)."""
+    """One sample per row of a split: (transformed frame, label), labels being the output of split_labels."""
 
-    def __init__(self, df, frame_dirs, transform):
-        self.paths = [os.path.join(frame_dirs[video_id], f'{frame_id:09d}.jpg')
-                      for video_id, frame_id in zip(df['video_id'], df['frame_id'])]
-        self.labels = df['annotation'].to_numpy(dtype=np.int64)
+    def __init__(self, df, labels, transform):
+        self.paths = df['path'].tolist()
+        self.labels = labels
         self.transform = transform
 
     def __len__(self):
