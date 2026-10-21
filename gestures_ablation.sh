@@ -1,0 +1,3 @@
+CUDA_VISIBLE_DEVICES=1 python main.py --task gesture_recognition --checkpoint outputs/2026-10-14_09-30-25/best.pt --temporal_model tcm   --wandb_group gesture_ablation
+CUDA_VISIBLE_DEVICES=1 python main.py --task gesture_recognition --checkpoint outputs/2026-10-14_09-30-25/best.pt --temporal_model mrtt  --wandb_group gesture_ablation
+CUDA_VISIBLE_DEVICES=1 python main.py --task gesture_recognition --checkpoint outputs/2026-10-14_09-30-25/best.pt --temporal_model frame --wandb_group gesture_ablation

@@ -1,0 +1,3 @@
+CUDA_VISIBLE_DEVICES=1 python main.py --task error_detection --checkpoint outputs/2026-10-16_15-16-08/best.pt --temporal_model tcm   --wandb_group error_ablation
+CUDA_VISIBLE_DEVICES=1 python main.py --task error_detection --checkpoint outputs/2026-10-16_15-16-08/best.pt --temporal_model mrtt  --wandb_group error_ablation
+CUDA_VISIBLE_DEVICES=1 python main.py --task error_detection --checkpoint outputs/2026-10-16_15-16-08/best.pt --temporal_model frame --wandb_group error_ablation

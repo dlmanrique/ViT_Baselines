@@ -1,9 +1,10 @@
 """
 Shared code for the frame-wise ViT baselines on SAR-RARP50 and CholecT45.
 
-- Command line arguments (parse_args) and default paths.
-- Task registry (TASKS): dataset, split folder, CSV name, metric type and
-  class names of each task selected with --task.
+- Command line arguments (parse_args) with the training defaults of the two
+  steps (STEP_DEFAULTS: frame-wise ViT, temporal module) and default paths.
+- Task registry (TASKS): dataset, split folder, CSV name, metric type, class
+  names and temporal-module sequence sizes of each task selected with --task.
 - Split loading: one row per annotated frame with its video, frame id, image
   path and labels.
     SAR-RARP50: split CSVs of preprocess_sarrarp50 and the JPEGs written by
@@ -13,6 +14,8 @@ Shared code for the frame-wise ViT baselines on SAR-RARP50 and CholecT45.
       triplet/VIDxx.txt), split by the official 5-fold cross-validation.
 - Frame dataset, image transforms, data loaders, class weights, optimizer
   parameter groups, LR schedule and seeding.
+- Frame sequences of the temporal module: chunks or whole videos of a split,
+  gathered into padded batches.
 - Timeline plot of ground-truth vs predicted classes per video (inference).
 
 Default paths are resolved from this file's folder (ViT_Baselines/), so the
@@ -34,6 +37,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
 from metrics import segment_intervals
+from models.temporal import TEMPORAL_MODELS
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SAR_ROOT = os.path.join(SCRIPT_DIR, 'Datasets', 'SAR-RARP50')
@@ -48,6 +52,10 @@ DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'outputs')
 #   monitor      validation metric that selects the best checkpoint
 #   class_names  index = annotation value (None: read from the dataset by resolve_task)
 #   class_colors (optional) one color per class; enables the test timeline plot of the inference
+#   temporal     second-step sequence sizes in frames: TCM chunks of chunk_size frames overlapping by
+#                chunk_overlap (70 s overlapping by 60 s, the MuST Cholec80 setting at 1 fps) and MRTT pooling
+#                sizes ks (0.4-0.7 token per median event, the CurConMix+ CholecT45 ratio; median event:
+#                5.8 s for gestures, 1.2 s for errors, 10 s for triplets)
 TASKS = {
     'gesture_recognition': {
         'dataset': 'sarrarp50',
@@ -69,6 +77,7 @@ TASKS = {
         # time (>= 1% of the transitions) stay distinguishable: worst pair OKLab Delta E 12.3
         # under protan/deutan simulation and 17.8 with normal vision.
         'class_colors': ['#898781', '#eda100', '#008300', '#e87ba4', '#2a78d6', '#eb6834', '#1baf7a', '#6250d6'],
+        'temporal': {'chunk_size': 700, 'chunk_overlap': 600, 'ks': [25, 30, 35, 40]},  # 10 Hz
     },
     'error_detection': {
         'dataset': 'sarrarp50',
@@ -77,14 +86,25 @@ TASKS = {
         'type': 'binary',
         'monitor': 'ap',
         'class_names': ['Normal', 'Error'],
+        'temporal': {'chunk_size': 350, 'chunk_overlap': 300, 'ks': [2, 3, 4, 5]},  # 5 Hz
     },
     'triplet_recognition': {
         'dataset': 'cholect45',
         'type': 'multilabel',
         'monitor': 'ap_ivt',
         'class_names': None,  # the 100 <instrument,verb,target> triplets of <cholect_root>/dict/triplet.txt
+        'temporal': {'chunk_size': 70, 'chunk_overlap': 60, 'ks': [4, 5, 6, 7]},  # 1 fps
     },
 }
+
+# Training defaults of the two steps for the arguments left unset on the command line: the frame-wise ViT
+# (main.py sweeps) and the temporal module on the frozen ViT
+STEP_DEFAULTS = {
+    'vit': {'epochs': 15, 'batch_size': 64, 'lr': 5e-5, 'weight_decay': 0.05, 'warmup_epochs': 1.0, 'dropout': 0.0},
+    'temporal': {'epochs': 30, 'lr': 1e-4, 'weight_decay': 0.01, 'warmup_epochs': 2.0, 'dropout': 0.1},
+}
+TEMPORAL_NUM_LAYERS = {'tcm': 2, 'mrtt': 3, 'frame': 0}  # MuST TCM on Cholec80; CurConMix+ MRTT layers per pathway
+TCM_BATCH_SIZE = 24  # chunks per step, as MuST; whole videos go one per step
 SPLITS = ('train', 'val', 'test')
 FRAMES_DIR = 'frames'
 FRAME_ASPECT = 16 / 9  # SAR-RARP50 frames are 960x540 and CholecT50 frames 854x480
@@ -117,14 +137,19 @@ BASELINE = '#c3c2b7'
 # ---------------------------------------------------------------------------
 
 def parse_args(argv=None):
-    """Parse the command line arguments of main.py."""
+    """Parse the command line arguments of main.py.
+
+    Training arguments left unset take the defaults of their step (STEP_DEFAULTS): the ViT, or the temporal
+    module when --temporal_model is given.
+    """
     parser = argparse.ArgumentParser(
-        description='Frame-wise ViT (ImageNet weights) for SAR-RARP50 and CholecT45: training or inference '
-                    '(--eval_only).')
+        description='Frame-wise ViT (ImageNet weights) for SAR-RARP50 and CholecT45: training, inference '
+                    '(--eval_only) or a temporal module on the frozen ViT (--temporal_model).')
 
     data = parser.add_argument_group('data')
-    data.add_argument('--task', choices=list(TASKS), default='gesture_recognition',
-                      help='Task: selects the dataset, the splits and the class names.')
+    data.add_argument('--task', choices=list(TASKS), default=None,
+                      help='Task: selects the dataset, the splits and the class names (default gesture_recognition; '
+                           'with --temporal_model: the task of --checkpoint, checked if given).')
     data.add_argument('--sar_root', default=DEFAULT_SAR_ROOT,
                       help='SAR-RARP50 root containing <split>/video_xx/frames/*.jpg.')
     data.add_argument('--splits_dir', default=None,
@@ -132,8 +157,9 @@ def parse_args(argv=None):
                            "(default: preprocess_sarrarp50/<task>).")
     data.add_argument('--cholect_root', default=DEFAULT_CHOLECT_ROOT,
                       help='triplet_recognition: CholecT50 release root (data/, triplet/, dict/).')
-    data.add_argument('--fold', type=int, choices=sorted(CHOLECT45_FOLDS), default=1,
-                      help='triplet_recognition: CholecT45 cross-validation fold used as test split.')
+    data.add_argument('--fold', type=int, choices=sorted(CHOLECT45_FOLDS), default=None,
+                      help='triplet_recognition: CholecT45 cross-validation fold used as test split (default 1; '
+                           'with --temporal_model: the fold of --checkpoint, checked if given).')
     data.add_argument('--num_workers', type=int, default=8, help='Data loader worker processes.')
 
     model = parser.add_argument_group('model')
@@ -143,24 +169,50 @@ def parse_args(argv=None):
     model.add_argument('--img_size', type=int, default=224,
                        help='Input size; full frames are resized to img_size x img_size.')
     model.add_argument('--drop_path', type=float, default=0.1, help='Stochastic depth rate.')
-    model.add_argument('--dropout', type=float, default=0.0, help='Dropout before the classification head.')
+    model.add_argument('--dropout', type=float, default=None,
+                       help='Dropout of the trained model: before the ViT head (default 0) or in the temporal '
+                            'Transformers (default 0.1).')
+
+    temporal = parser.add_argument_group('temporal module (second step, on the frozen ViT of --checkpoint)')
+    temporal.add_argument('--temporal_model', choices=TEMPORAL_MODELS, default=None,
+                          help='Train this temporal module on the embeddings of the frozen ViT of --checkpoint: '
+                               'tcm (MuST), mrtt (CurConMix+) or frame (MRTT frame-wise branch alone).')
+    temporal.add_argument('--chunk_size', type=int, default=None,
+                          help='tcm: frames per chunk, 0 for whole videos (default per task, TASKS temporal).')
+    temporal.add_argument('--chunk_overlap', type=int, default=None,
+                          help='tcm: frames shared by consecutive chunks (default per task).')
+    temporal.add_argument('--ks', type=int, nargs='+', default=None,
+                          help='mrtt: pooling sizes of the pathways, in frames (default per task).')
+    temporal.add_argument('--no_frame_branch', action='store_true', help='mrtt: drop the frame-wise branch.')
+    temporal.add_argument('--num_layers', type=int, default=None,
+                          help='Transformer layers (default 2 for tcm, 3 per pathway for mrtt).')
+    temporal.add_argument('--num_heads', type=int, default=4)
+    temporal.add_argument('--ffn_dim', type=int, default=2048,
+                          help='Hidden size of the Transformer feed-forward blocks.')
+    temporal.add_argument('--tcm_dim', type=int, default=768, help='tcm: Transformer width after the input projection.')
 
     train = parser.add_argument_group('training')
-    train.add_argument('--epochs', type=int, default=15)
-    train.add_argument('--batch_size', type=int, default=64)
-    train.add_argument('--eval_batch_size', type=int, default=128)
-    train.add_argument('--lr', type=float, default=5e-5, help='Peak learning rate (AdamW).')
+    train.add_argument('--epochs', type=int, default=None, help='Default 15 for the ViT, 30 for the temporal module.')
+    train.add_argument('--batch_size', type=int, default=None,
+                       help=f'Default 64 frames for the ViT; {TCM_BATCH_SIZE} chunks for the TCM, 1 video for '
+                            'whole-video temporal modules.')
+    train.add_argument('--eval_batch_size', type=int, default=128,
+                       help='Frames per ViT forward pass at evaluation and when embedding frames.')
+    train.add_argument('--lr', type=float, default=None,
+                       help='Peak learning rate (AdamW), default 5e-5 for the ViT, 1e-4 for the temporal module.')
     train.add_argument('--min_lr', type=float, default=1e-6, help='Final learning rate of the cosine schedule.')
-    train.add_argument('--weight_decay', type=float, default=0.05)
-    train.add_argument('--warmup_epochs', type=float, default=1.0, help='Linear warmup length in epochs.')
+    train.add_argument('--weight_decay', type=float, default=None,
+                       help='Default 0.05 for the ViT, 0.01 for the temporal module.')
+    train.add_argument('--warmup_epochs', type=float, default=None,
+                       help='Linear warmup length in epochs, default 1 for the ViT, 2 for the temporal module.')
     train.add_argument('--grad_clip', type=float, default=1.0, help='Max gradient norm (0 disables clipping).')
     train.add_argument('--label_smoothing', type=float, default=0.0)
     train.add_argument('--class_weighting', choices=['none', 'inverse', 'inverse_sqrt'], default='none',
                        help='Cross-entropy class weights from the training frame counts.')
     train.add_argument('--crop_scale_min', type=float, default=0.8,
-                       help='Min area fraction of the training random crop (1 disables cropping).')
+                       help='Min area fraction of the training random crop of the ViT (1 disables cropping).')
     train.add_argument('--color_jitter', type=float, default=0.2,
-                       help='Brightness/contrast/saturation jitter for training (0 disables it).')
+                       help='Brightness/contrast/saturation jitter for the ViT training (0 disables it).')
     train.add_argument('--no_amp', action='store_true', help='Disable bfloat16 autocast.')
     train.add_argument('--log_every', type=int, default=50, help='Log the training loss to wandb every N steps.')
 
@@ -172,7 +224,9 @@ def parse_args(argv=None):
     run.add_argument('--eval_only', action='store_true',
                      help='Inference: evaluate --checkpoint on the val and test splits of --task and print the '
                           'metrics (no training, no wandb).')
-    run.add_argument('--checkpoint', default=None, help='Path of the trained ViT (best.pt) used with --eval_only.')
+    run.add_argument('--checkpoint', default=None,
+                     help='Trained ViT (best.pt of a training run): evaluated by --eval_only, frozen backbone of '
+                          '--temporal_model.')
 
     logging_group = parser.add_argument_group('wandb')
     logging_group.add_argument('--wandb_project', default='ViT_Baselines')
@@ -184,13 +238,48 @@ def parse_args(argv=None):
                                help='wandb group of the run, e.g. one name shared by the 5 folds of a cross-validation.')
 
     args = parser.parse_args(argv)
-    if args.eval_only and not args.checkpoint:
-        parser.error('--eval_only requires --checkpoint')
+    if not args.temporal_model:  # a temporal run takes them from its ViT checkpoint (run_temporal)
+        args.task = args.task or 'gesture_recognition'
+        args.fold = args.fold or 1
+    if (args.eval_only or args.temporal_model) and not args.checkpoint:
+        parser.error('--eval_only and --temporal_model require --checkpoint')
+    if args.eval_only and args.temporal_model:
+        parser.error('--eval_only evaluates a ViT checkpoint; it cannot be combined with --temporal_model')
     if not 0 < args.crop_scale_min <= 1:
         parser.error('--crop_scale_min must be in (0, 1]')
-    if TASKS[args.task]['type'] == 'multilabel' and (args.class_weighting != 'none' or args.label_smoothing > 0):
-        parser.error('--class_weighting and --label_smoothing only apply to the cross-entropy tasks')
+    if args.class_weighting != 'none' or args.label_smoothing > 0:
+        if args.temporal_model:
+            parser.error('--class_weighting and --label_smoothing only apply to the ViT training')
+        if TASKS[args.task]['type'] == 'multilabel':
+            parser.error('--class_weighting and --label_smoothing only apply to the cross-entropy tasks')
+    for name, value in STEP_DEFAULTS['temporal' if args.temporal_model else 'vit'].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
     return args
+
+
+def resolve_temporal_args(args):
+    """Fill the temporal-module settings of --task left unset and clear the ones the module does not use.
+
+    Sequence sizes come from TASKS[task]['temporal']; whole-video modules get
+    chunk_size 0, so the wandb config shows what each run actually used.
+    """
+    defaults = TASKS[args.task]['temporal']
+    if args.temporal_model == 'tcm':
+        args.chunk_size = defaults['chunk_size'] if args.chunk_size is None else args.chunk_size
+        if args.chunk_size == 0:  # whole videos: no overlap
+            args.chunk_overlap = 0
+        elif args.chunk_overlap is None:
+            args.chunk_overlap = defaults['chunk_overlap']
+        if args.chunk_size > 0 and not 0 <= args.chunk_overlap < args.chunk_size:
+            raise ValueError(f'--chunk_overlap must be in [0, {args.chunk_size}), got {args.chunk_overlap}')
+    else:
+        args.chunk_size, args.chunk_overlap = 0, 0
+    args.ks = (defaults['ks'] if args.ks is None else args.ks) if args.temporal_model == 'mrtt' else None
+    if args.num_layers is None:
+        args.num_layers = TEMPORAL_NUM_LAYERS[args.temporal_model]
+    if args.batch_size is None:
+        args.batch_size = TCM_BATCH_SIZE if args.chunk_size > 0 else 1
 
 
 def resolve_task(args):
@@ -383,6 +472,50 @@ def build_loader(dataset, batch_size, train, num_workers, seed):
         worker_init_fn=seed_worker,
         generator=generator,
     )
+
+
+# ---------------------------------------------------------------------------
+# Frame sequences (temporal module)
+# ---------------------------------------------------------------------------
+
+def chunk_starts(length, size, overlap):
+    """Return the first frames of the chunks of `size` frames, overlapping by `overlap`, that cover a video.
+
+    As in MuST, the last chunk is shifted back to end at the last frame. A
+    video of at most `size` frames, or size 0, gives one sequence: the video.
+    """
+    if size <= 0 or length <= size:
+        return [0]
+    starts = list(range(0, length - size + 1, size - overlap))
+    if starts[-1] + size < length:
+        starts.append(length - size)
+    return starts
+
+
+def split_sequences(df, chunk_size, chunk_overlap):
+    """Return the (first row, length) of the sequences of a split: the chunks of every video, or whole videos.
+
+    The rows of df are sorted by video and frame, so every video is a contiguous range of rows.
+    """
+    video_ids = df['video_id'].to_numpy()
+    starts = np.flatnonzero(np.r_[True, video_ids[1:] != video_ids[:-1]])
+    lengths = np.diff(np.r_[starts, len(df)])
+    return [(int(start) + s, min(chunk_size, int(length)) if chunk_size > 0 else int(length))
+            for start, length in zip(starts, lengths) for s in chunk_starts(int(length), chunk_size, chunk_overlap)]
+
+
+def gather_sequences(values, sequences):
+    """Stack the rows of the sequences (first row, length) of values into a zero-padded (B x T x ...) batch.
+
+    Returns (batch, padding mask (B x T), True on padded positions).
+    """
+    max_length = max(length for _, length in sequences)
+    batch = values.new_zeros((len(sequences), max_length) + values.shape[1:])
+    padding = torch.ones(len(sequences), max_length, dtype=torch.bool, device=values.device)
+    for i, (start, length) in enumerate(sequences):
+        batch[i, :length] = values[start:start + length]
+        padding[i, :length] = False
+    return batch, padding
 
 
 # ---------------------------------------------------------------------------
