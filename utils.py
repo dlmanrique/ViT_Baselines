@@ -23,6 +23,7 @@ run does not depend on the current working directory.
 """
 
 import argparse
+import hashlib
 import math
 import os
 import random
@@ -33,6 +34,7 @@ import torch
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
 from PIL import Image
+from scipy.ndimage import uniform_filter1d
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
@@ -52,6 +54,7 @@ DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'outputs')
 #   monitor      validation metric that selects the best checkpoint
 #   class_names  index = annotation value (None: read from the dataset by resolve_task)
 #   class_colors (optional) one color per class; enables the test timeline plot of the inference
+#   fps          annotated frames per second of the split CSVs / labels
 #   temporal     second-step sequence sizes in frames: TCM chunks of chunk_size frames overlapping by
 #                chunk_overlap (70 s overlapping by 60 s, the MuST Cholec80 setting at 1 fps) and MRTT pooling
 #                sizes ks (0.4-0.7 token per median event, the CurConMix+ CholecT45 ratio; median event:
@@ -77,7 +80,8 @@ TASKS = {
         # time (>= 1% of the transitions) stay distinguishable: worst pair OKLab Delta E 12.3
         # under protan/deutan simulation and 17.8 with normal vision.
         'class_colors': ['#898781', '#eda100', '#008300', '#e87ba4', '#2a78d6', '#eb6834', '#1baf7a', '#6250d6'],
-        'temporal': {'chunk_size': 700, 'chunk_overlap': 600, 'ks': [25, 30, 35, 40]},  # 10 Hz
+        'fps': 10,
+        'temporal': {'chunk_size': 700, 'chunk_overlap': 600, 'ks': [25, 30, 35, 40]},
     },
     'error_detection': {
         'dataset': 'sarrarp50',
@@ -86,14 +90,16 @@ TASKS = {
         'type': 'binary',
         'monitor': 'ap',
         'class_names': ['Normal', 'Error'],
-        'temporal': {'chunk_size': 350, 'chunk_overlap': 300, 'ks': [2, 3, 4, 5]},  # 5 Hz
+        'fps': 5,
+        'temporal': {'chunk_size': 350, 'chunk_overlap': 300, 'ks': [2, 3, 4, 5]},
     },
     'triplet_recognition': {
         'dataset': 'cholect45',
         'type': 'multilabel',
         'monitor': 'ap_ivt',
         'class_names': None,  # the 100 <instrument,verb,target> triplets of <cholect_root>/dict/triplet.txt
-        'temporal': {'chunk_size': 70, 'chunk_overlap': 60, 'ks': [4, 5, 6, 7]},  # 1 fps
+        'fps': 1,
+        'temporal': {'chunk_size': 70, 'chunk_overlap': 60, 'ks': [4, 5, 6, 7]},
     },
 }
 
@@ -106,6 +112,8 @@ STEP_DEFAULTS = {
 TEMPORAL_NUM_LAYERS = {'tcm': 2, 'mrtt': 3, 'frame': 0}  # MuST TCM on Cholec80; CurConMix+ MRTT layers per pathway
 TCM_BATCH_SIZE = 24  # chunks per step, as MuST; whole videos go one per step
 SPLITS = ('train', 'val', 'test')
+# Task names of the exported logits (--export_logits), as in the kinematics late-fusion package
+EXPORT_TASK_NAMES = {'gesture_recognition': 'gesture', 'error_detection': 'error', 'triplet_recognition': 'triplet'}
 FRAMES_DIR = 'frames'
 FRAME_ASPECT = 16 / 9  # SAR-RARP50 frames are 960x540 and CholecT50 frames 854x480
 
@@ -221,6 +229,12 @@ def parse_args(argv=None):
                      help='Folder with one subfolder per run (<run name>/best.pt) and the local wandb files.')
     run.add_argument('--device', default='cuda:0')
     run.add_argument('--seed', type=int, default=42)
+    run.add_argument('--smooth_seconds', type=float, nargs='+', default=None,
+                     help='--eval_only: also evaluate the ViT probabilities averaged over centered windows of these '
+                          'lengths in seconds, within each video (temporal-context diagnostic, no training).')
+    run.add_argument('--export_logits', default=None,
+                     help='--eval_only: also write the test logits of every video (<dir>/test/<video_id>.npz) and a '
+                          'model.json manifest to this folder, e.g. for late fusion.')
     run.add_argument('--eval_only', action='store_true',
                      help='Inference: evaluate --checkpoint on the val and test splits of --task and print the '
                           'metrics (no training, no wandb).')
@@ -243,6 +257,8 @@ def parse_args(argv=None):
         args.fold = args.fold or 1
     if (args.eval_only or args.temporal_model) and not args.checkpoint:
         parser.error('--eval_only and --temporal_model require --checkpoint')
+    if (args.smooth_seconds or args.export_logits) and not args.eval_only:
+        parser.error('--smooth_seconds and --export_logits only apply to --eval_only')
     if args.eval_only and args.temporal_model:
         parser.error('--eval_only evaluates a ViT checkpoint; it cannot be combined with --temporal_model')
     if not 0 < args.crop_scale_min <= 1:
@@ -337,6 +353,23 @@ def cholect45_videos(fold, split):
         trainval = sum([videos for k, videos in CHOLECT45_FOLDS.items() if k != fold], [])
         videos = trainval[-NUM_VAL_VIDEOS:] if split == 'val' else trainval[:-NUM_VAL_VIDEOS]
     return [f'VID{video:02d}' for video in videos]
+
+
+def split_video_ids(args, task, split):
+    """Return the sorted video ids of a split of the task (args gives the CholecT45 fold and the SAR split folder)."""
+    if task['dataset'] == 'cholect45':
+        return sorted(cholect45_videos(args.fold, split))
+    path = os.path.join(args.splits_dir or task['splits_dir'], f"{split}_sarrarp50_{task['csv_suffix']}.csv")
+    return sorted(pd.read_csv(path, usecols=['video_id'])['video_id'].unique().tolist())
+
+
+def file_sha256(path):
+    """Return the SHA-256 hex digest of a file, read in 16 MB blocks."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 24), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def load_cholect45_split(cholect_root, fold, split):
@@ -502,6 +535,19 @@ def split_sequences(df, chunk_size, chunk_overlap):
     lengths = np.diff(np.r_[starts, len(df)])
     return [(int(start) + s, min(chunk_size, int(length)) if chunk_size > 0 else int(length))
             for start, length in zip(starts, lengths) for s in chunk_starts(int(length), chunk_size, chunk_overlap)]
+
+
+def smooth_probs(probs, df, window):
+    """Average the (num_frames x num_classes) probabilities over a centered moving window of `window` frames.
+
+    Each video (contiguous rows of df) is smoothed on its own; the window is
+    cut at the video borders (edge frames repeated).
+    """
+    smoothed = probs.copy()
+    for start, length in split_sequences(df, 0, 0):
+        smoothed[start:start + length] = uniform_filter1d(probs[start:start + length], size=window, axis=0,
+                                                          mode='nearest')
+    return smoothed
 
 
 def gather_sequences(values, sequences):

@@ -70,6 +70,7 @@ Usage (from any folder, Base_Leo environment):
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -88,10 +89,10 @@ from tqdm import tqdm
 from metrics import TRIPLET_COMPONENTS, compute_metrics
 from models.temporal import build_temporal_model
 from models.vit import build_vit, vit_data_config
-from utils import (SPLITS, TASKS, FrameDataset, build_loader, build_transforms, check_frames, class_weights,
-                   find_frame_dirs, gather_sequences, load_cholect45_split, load_split, param_groups, parse_args,
-                   plot_timelines, resolve_task, resolve_temporal_args, set_seed, split_labels, split_sequences,
-                   warmup_cosine)
+from utils import (EXPORT_TASK_NAMES, SPLITS, TASKS, VIDEO_FPS, FrameDataset, build_loader, build_transforms,
+                   check_frames, class_weights, file_sha256, find_frame_dirs, gather_sequences, load_cholect45_split,
+                   load_split, param_groups, parse_args, plot_timelines, resolve_task, resolve_temporal_args, set_seed,
+                   smooth_probs, split_labels, split_sequences, split_video_ids, warmup_cosine)
 
 NUM_PLOT_VIDEOS = 3  # random test videos drawn in the inference timeline plot
 
@@ -141,15 +142,19 @@ def class_probs(logits, multilabel):
 
 
 @torch.no_grad()
-def predict(model, loader, device, amp, desc, multilabel):
-    """Return the class probabilities (num_frames x num_classes) of every frame, in loader order."""
+def predict_logits(model, loader, device, amp, desc):
+    """Return the logits (num_frames x num_classes) of every frame, as a float32 tensor on the CPU in loader order."""
     model.eval()
-    probs = []
+    logits = []
     for images, _ in tqdm(loader, desc=desc, leave=False):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-            logits = model(images.to(device, non_blocking=True)).float()
-        probs.append(class_probs(logits, multilabel).cpu())
-    return torch.cat(probs).numpy()
+            logits.append(model(images.to(device, non_blocking=True)).float().cpu())
+    return torch.cat(logits)
+
+
+def predict(model, loader, device, amp, desc, multilabel):
+    """Return the class probabilities (num_frames x num_classes) of every frame, in loader order."""
+    return class_probs(predict_logits(model, loader, device, amp, desc), multilabel).numpy()
 
 
 def split_results(probs, df, task):
@@ -267,10 +272,71 @@ def print_split_results(split, loss, metrics, class_names):
                            columns=range(len(class_names))).to_string())
 
 
+def export_logits(directory, df, logits, task, args, checkpoint):
+    """Write the test logits of every video to <directory>/test/<video_id>.npz, plus <directory>/model.json.
+
+    The files follow the schema of the kinematics late-fusion package: video_id,
+    the native frame_ids of the split rows, logits and probabilities: (T x 8)
+    softmax for gestures, (T,) binary log-odds z_error - z_normal and their
+    sigmoid for errors, (T x 100) sigmoid per triplet for triplets. model.json
+    records the task, class order, frame rates, val/test videos, the videos the
+    model was fitted on (its training split; the validation split only selected
+    the checkpoint) and the checkpoint hashes.
+    """
+    multilabel, binary = task['type'] == 'multilabel', task['type'] == 'binary'
+    if binary:
+        logits = logits[:, 1] - logits[:, 0]
+        probs = 1 / (1 + np.exp(-logits))
+    else:
+        probs = class_probs(torch.from_numpy(logits), multilabel).numpy()
+    for video_id, rows in df.groupby('video_id').indices.items():
+        path = os.path.join(directory, 'test', f'{video_id}.npz')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.savez_compressed(path, video_id=np.array(video_id), frame_ids=df['frame_id'].to_numpy()[rows],
+                            logits=logits[rows].astype(np.float32), probabilities=probs[rows].astype(np.float32))
+
+    cholect = task['dataset'] == 'cholect45'
+    trained_args = checkpoint['args']
+    train_videos = split_video_ids(args, task, 'train')
+    meta = {
+        'schema_version': 1,
+        'model_id': checkpoint.get('wandb_run'),
+        'task': EXPORT_TASK_NAMES[args.task],
+        'fold': args.fold if cholect else None,
+        'class_order': list(range(len(task['class_names']))),
+        'class_names': task['class_names'],
+        'hz': task['fps'],
+        'native_fps': task['fps'] if cholect else VIDEO_FPS,  # unit of frame_ids
+        'split_videos': {split: split_video_ids(args, task, split) for split in ('val', 'test')},
+        'fit_videos_by_split': {'val': train_videos, 'test': train_videos},
+        'fit_manifest_verified': True,
+        'checkpoint': os.path.abspath(args.checkpoint),
+        'checkpoint_sha256': file_sha256(args.checkpoint),
+        'logits_kind': 'multilabel' if multilabel else 'binary_log_odds' if binary else 'multiclass',
+        'model': (f'frozen {trained_args["model"]} + {trained_args["temporal_model"]}'
+                  if trained_args.get('temporal_model') else f'frame-wise {trained_args["model"]}'),
+        'selection': f'validation {task["monitor"]} (best epoch {checkpoint["epoch"]})',
+        'scope': 'Fitted on the training split (the ViT and, for temporal modules, the temporal module on the '
+                 'frozen ViT); the validation split only selected the checkpoint. ImageNet pretraining is upstream.',
+    }
+    if trained_args.get('temporal_model'):
+        meta['vit_checkpoint'] = trained_args['checkpoint']
+        meta['vit_checkpoint_sha256'] = file_sha256(trained_args['checkpoint'])
+    with open(os.path.join(directory, 'model.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f'\nTest logits of {df["video_id"].nunique()} videos written to {os.path.abspath(directory)}')
+
+
 def run_inference(args):
-    """Evaluate the ViT in --checkpoint on the val and test splits of --task and print the metrics."""
+    """Evaluate a trained ViT, or a temporal module on its frozen ViT, on the val and test splits and print the metrics.
+
+    --checkpoint may be a ViT checkpoint or a temporal-module checkpoint of
+    --temporal_model training (whose frozen ViT is loaded from its own
+    --checkpoint). With --export_logits, the test logits are also written to
+    that folder (export_logits).
+    """
     task = resolve_task(args)
-    class_names = task['class_names']
+    class_names, multilabel = task['class_names'], task['type'] == 'multilabel'
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     trained_args = checkpoint['args']
     trained_task = trained_args.get('task', 'gesture_recognition')  # checkpoints saved before --task existed
@@ -283,26 +349,57 @@ def run_inference(args):
     amp = not args.no_amp and device.type == 'cuda'
     torch.backends.cudnn.benchmark = True
 
-    model = load_vit(checkpoint, len(class_names), device)
-    _, eval_transform = build_transforms(trained_args['img_size'], vit_data_config(model), args.crop_scale_min,
-                                         args.color_jitter)
+    temporal_model = trained_args.get('temporal_model')
+    vit_checkpoint = torch.load(trained_args['checkpoint'], map_location='cpu') if temporal_model else checkpoint
+    vit = load_vit(vit_checkpoint, len(class_names), device)
+    _, eval_transform = build_transforms(vit_checkpoint['args']['img_size'], vit_data_config(vit),
+                                         args.crop_scale_min, args.color_jitter)
+    if temporal_model:
+        model = build_temporal_model(temporal_model, vit.num_features, len(class_names), trained_args['num_layers'],
+                                     trained_args['num_heads'], trained_args['ffn_dim'], trained_args['dropout'],
+                                     trained_args['tcm_dim'], trained_args['ks'], not trained_args['no_frame_branch'])
+        model.load_state_dict(checkpoint['model'])
+        model.to(device)
     monitor = task['monitor']
     print(f'Checkpoint: {os.path.abspath(args.checkpoint)}')
-    print(f'Task {args.task} | model {trained_args["model"]} | epoch {checkpoint["epoch"]} | '
-          f'val {monitor} during training {checkpoint["val_metrics"][monitor]:.4f}')
+    print(f'Task {args.task} | model {trained_args["model"]}' + (f' + {temporal_model}' if temporal_model else '')
+          + f' | epoch {checkpoint["epoch"]} | val {monitor} during training {checkpoint["val_metrics"][monitor]:.4f}')
 
     splits = load_data(args, task, ('val', 'test'))
     for split, df in splits.items():
-        loader = build_loader(FrameDataset(df, split_labels(df, task), eval_transform), args.eval_batch_size,
-                              train=False, num_workers=args.num_workers, seed=args.seed)
-        loss, metrics, probs = evaluate(model, loader, df, device, amp, split, task)
+        if temporal_model:
+            embeddings, _ = embed_frames(vit, df, split_labels(df, task), eval_transform, args, device, amp,
+                                         f'embed {split}')
+            sequences = split_sequences(df, trained_args['chunk_size'], trained_args['chunk_overlap'])
+            probs = predict_sequences(model, embeddings, sequences, trained_args['batch_size'], multilabel, device,
+                                      amp)
+            logits = predict_sequences(model, embeddings, sequences, trained_args['batch_size'], multilabel, device,
+                                       amp, logits=True)
+        else:
+            loader = build_loader(FrameDataset(df, split_labels(df, task), eval_transform), args.eval_batch_size,
+                                  train=False, num_workers=args.num_workers, seed=args.seed)
+            logits = predict_logits(vit, loader, device, amp, split)
+            probs = class_probs(logits, multilabel).numpy()
+            logits = logits.numpy()
+        loss, metrics = split_results(probs, df, task)
         print_split_results(split, loss, metrics, class_names)
+        if split == 'test' and args.export_logits:
+            export_logits(args.export_logits, df, logits, task, args, checkpoint)
+
+        if args.smooth_seconds:
+            print(f'\n{split}: ViT probabilities averaged over centered windows ({task["fps"]} frames per second)')
+            print(f'  {"none":>13} | {format_metrics(metrics["scalars"], task["type"])}')
+            for seconds in args.smooth_seconds:
+                window = max(1, round(seconds * task['fps']))
+                smoothed_metrics = split_results(smooth_probs(probs, df, window), df, task)[1]
+                print(f'  {seconds:5g} s ({window:>3}) | {format_metrics(smoothed_metrics["scalars"], task["type"])}')
 
         if split == 'test' and 'class_colors' in task:
             video_ids = sorted(random.Random(args.seed).sample(sorted(df['video_id'].unique()), NUM_PLOT_VIDEOS))
             path = os.path.join(os.path.dirname(os.path.abspath(args.checkpoint)), f'test_timelines_{args.task}.png')
+            model_name = f'frozen ViT + {temporal_model}' if temporal_model else 'frame-wise ViT'
             plot_timelines(df, probs.argmax(axis=1), metrics['per_video'], class_names, task['class_colors'],
-                           video_ids, path, f'Test set: ground truth vs frame-wise ViT ({args.task})')
+                           video_ids, path, f'Test set: ground truth vs {model_name} ({args.task})')
             print(f'\nTimelines of {video_ids} saved to {path}')
 
 
@@ -475,26 +572,28 @@ def train_temporal_epoch(model, embeddings, labels, sequences, criterion, optimi
 
 
 @torch.no_grad()
-def predict_sequences(model, embeddings, sequences, batch_size, multilabel, device, amp):
+def predict_sequences(model, embeddings, sequences, batch_size, multilabel, device, amp, logits=False):
     """Return the (num_frames x num_classes) class probabilities of a split from its sequences, in row order.
 
-    The probabilities of a frame are averaged over the sequences that contain
-    it (overlapping TCM chunks); with whole videos each frame has one.
+    The probabilities (or, with logits=True, the logits) of a frame are
+    averaged over the sequences that contain it (overlapping TCM chunks); with
+    whole videos each frame has one.
     """
     model.eval()
-    probs, counts = None, torch.zeros(len(embeddings), device=device)
+    scores, counts = None, torch.zeros(len(embeddings), device=device)
     for first in range(0, len(sequences), batch_size):
         batch = sequences[first:first + batch_size]
         x, padding = gather_sequences(embeddings, batch)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-            logits = model(x, padding_mask=padding)
-        batch_probs = class_probs(logits.float(), multilabel)
-        if probs is None:
-            probs = torch.zeros(len(embeddings), batch_probs.shape[-1], device=device)
+            batch_scores = model(x, padding_mask=padding).float()
+        if not logits:
+            batch_scores = class_probs(batch_scores, multilabel)
+        if scores is None:
+            scores = torch.zeros(len(embeddings), batch_scores.shape[-1], device=device)
         for i, (start, length) in enumerate(batch):
-            probs[start:start + length] += batch_probs[i, :length]
+            scores[start:start + length] += batch_scores[i, :length]
             counts[start:start + length] += 1
-    return (probs / counts.unsqueeze(1)).cpu().numpy()
+    return (scores / counts.unsqueeze(1)).cpu().numpy()
 
 
 def run_temporal(args):
